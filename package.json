@@ -1,0 +1,41 @@
+{
+  "name": "nobo-ecohub",
+  "version": "0.1.0",
+  "description": "Modern TypeScript SDK & CLI for the Nobø Ecohub (discontinued) smart‑heating gateway from Glen Dimplex Nordic AS",
+  "keywords": [
+    "smart",
+    "heating",
+    "glen",
+    "dimplex",
+    "nobohub",
+    "ecohub",
+    "nobo",
+    "ecohub",
+    "sdk",
+    "cli"
+  ],
+  "homepage": "https://github.com/irixi/nobo-ecohub#readme",
+  "bugs": {
+    "url": "https://github.com/irixi/nobo-ecohub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/irixi/nobo-ecohub.git"
+  },
+  "license": "MIT",
+  "author": "Kim Forsman",
+  "type": "module",
+  "main": "dist/index.js",
+  "directories": {
+    "example": "examples"
+  },
+  "scripts": {
+    "test": "pnpm run test"
+  },
+  "dependencies": {
+    "undici-types": "^6.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29"
+  }
+}
