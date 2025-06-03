@@ -24,7 +24,6 @@
   },
   "license": "MIT",
   "author": "Kim Forsman",
-  "type": "module",
   "main": "dist/index.js",
   "directories": {
     "example": "examples"
