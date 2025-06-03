@@ -1,9 +1,9 @@
 export class DeviceModel {
   static readonly THERMOSTAT_HEATER = "THERMOSTAT_HEATER";
   static readonly THERMOSTAT_FLOOR = "THERMOSTAT_FLOOR";
+  static readonly THERMOSTAT_ROOM = "THERMOSTAT_ROOM";
   static readonly SWITCH = "SWITCH";
   static readonly SWITCH_OUTLET = "SWITCH_OUTLET";
-  static readonly THERMOSTAT_ROOM = "THERMOSTAT_ROOM";
   static readonly CONTROL_PANEL = "CONTROL_PANEL";
   static readonly UNKNOWN = "UNKNOWN";
 

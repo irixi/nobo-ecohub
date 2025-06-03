@@ -1,242 +1,133 @@
 import net from "node:net";
-import { PROTOCOL_VERSION, Cmd, Resp, Override } from "./proto/constants.js";
-import { parse, ResponseMessage } from "./proto/parser.js";
+import { Cmd, Resp, Override, PROTOCOL_VERSION } from "./proto/constants.js";
 import { frames } from "./transport/frames.js";
 import { discoverHubs } from "./transport/discovery.js";
+import { parse, ResponseMessage } from "./proto/parser.js";
 import { ZoneVO, ComponentVO, WeekProfileVO, OverrideVO } from "./model/valueObjects.js";
-import {
-  assertTemperature,
-  isValidDatetime,
-  quarterMinutes,
-} from "./proto/validation.js";
-import {
-  HubInfoDTO,
-  ZoneDTO,
-  ComponentDTO,
-  WeekProfileDTO,
-  OverrideDTO,
-} from "./proto/dto.js";
+import { assertTemperature, isValidDatetime, quarterMinutes } from "./proto/validation.js";
+import { HubInfoDTO } from "./proto/dto.js";
+import { EventEmitter } from "node:events";
 
-/** Public‑facing high‑level API */
-export class NoboHub {
-  // ────────────────────── state ──────────────────────
-  private socket?: net.Socket;
+export class NoboHub extends EventEmitter {
+  private sock?: net.Socket;
   private zones = new Map<string, ZoneVO>();
-  private components = new Map<string, ComponentVO>();
-  private weekProfiles = new Map<string, WeekProfileVO>();
+  private comps = new Map<string, ComponentVO>();
+  private weeks = new Map<string, WeekProfileVO>();
   private overrides = new Map<string, OverrideVO>();
-  private temperatures = new Map<string, string>();
-  private hubReady!: Promise<void>; // resolves when hub‑info received
+  private temps = new Map<string, string>();
+  private hubInfo?: HubInfoDTO;
+  private lastRx = Date.now();
 
-  // ────────────────────── ctor ──────────────────────
-  constructor(
-    private readonly serial: string,
-    private readonly ip?: string,
-    private readonly discover = true,
-    private readonly now: () => Date = () => new Date(),
-  ) {}
+  constructor(private serial: string, private ip?: string, private useDiscovery = true) { super(); }
 
-  // ────────────────────── lifecycle ──────────────────────
+  // ───────────────────────── connect ─────────────────────────
   async connect(): Promise<void> {
-    if (this.discover) {
-      const hubs = await discoverHubs();
-      for (const [ip, hubSerial] of hubs) {
-        try {
-          if (await this.connectTcp(ip, hubSerial)) break;
-        } catch (err) {
-          console.error(`connect to ${ip} failed`, err);
-        }
-      }
-    } else if (this.ip) {
-      await this.connectTcp(this.ip, this.serial);
-    } else {
-      throw new Error("Unable to connect: no IP or discovery");
-    }
+    const hubs = this.useDiscovery ? await discoverHubs() : [[this.ip!, this.serial]] as Array<[string, string]>;
+    for (const [ip, sn] of hubs) try { if (await this.connectTcp(ip, sn)) return; } catch {}
+    throw new Error("Unable to connect to any hub");
   }
 
-  private async connectTcp(ip: string, hubSerial: string): Promise<boolean> {
-    this.socket = net.createConnection({ 
-      host: ip, 
-      port: 27779, 
-      timeout: 30000, 
-      keepAlive: true, 
-      keepAliveInitialDelay: 12000 
-    });
-    const sock = this.socket;
+  private async connectTcp(ip: string, serial: string): Promise<boolean> {
+    this.sock = net.createConnection({ host: ip, port: 27779 });
+    await once(this.sock, "connect");
+    this.sock.setKeepAlive(true, 20_000);
 
-    const heartbeatInterval = setInterval(async () => {
-      await this.send([Cmd.HANDSHAKE]);
-      const response = await this.nextFrame();
-       if (!response) throw new Error("handshake failed");
-      //console.log("Heartbeat sent to hub");
-    }, 10000); // Every 10 seconds
-
-    sock.on("close", () => clearInterval(heartbeatInterval));
-
-    await new Promise<void>((resolve, reject) => {
-      sock.once("error", reject);
-      sock.once("connect", () => resolve());
-    });
-
-    // handshake
-    await this.send([Cmd.START, PROTOCOL_VERSION, hubSerial, this.timestamp14()]);
-    const res1 = await this.nextFrame();
-    if (res1[0] !== Cmd.START || res1[1] !== PROTOCOL_VERSION) {
-      throw new Error("protocol‑version mismatch");
-    }
-
+    await this.send([Cmd.START, PROTOCOL_VERSION, serial, this.ts14()]);
+    const ok = await this.recvRaw();
+    if (ok[0] !== Cmd.START) throw new Error("bad hello");
     await this.send([Cmd.HANDSHAKE]);
-    const res2 = await this.nextFrame();
-    if (res2[0] !== Cmd.HANDSHAKE) throw new Error("handshake failed");
+    const hs = await this.recvRaw();
+    if (hs[0] !== Cmd.HANDSHAKE) throw new Error("handshake failed");
 
-    // pump frames in background
-    this.hubReady = this.bootstrap();
-
+    this.pump(); // start frame pump
+    await this.send([Cmd.GET_ALL_INFO]);
+    await once(this, "ready");
     return true;
   }
 
-  private async bootstrap(): Promise<void> {
-    if (!this.socket) throw new Error("socket not ready");
-    await this.send([Cmd.GET_ALL_INFO]);
+  // ─────────────────── internal helpers ───────────────────
+  private async send(words: string[]) { if (this.sock) await new Promise<void>((res, rej) => this.sock!.write(words.join(" ") + "\r", e => e ? rej(e) : res())); }
+  private ts14(d = new Date()) { return d.toISOString().replace(/[^0-9]/g, "").slice(0, 14); }
 
-    for await (const raw of frames(this.socket)) {
-      this.process(parse(raw));
-      if (this.hubInfoReceived) {
-        this.hubReady = Promise.resolve(); // Resolve the ready promise
-      }
-    }
-  }
-
-  private hubInfoReceived = false;
-
-  // ────────────────────── protocol helpers ──────────────────────
-  private send(words: string[]): Promise<void> {
-    if (!this.socket) return Promise.reject(new Error("socket closed"));
-    return new Promise((resolve, reject) => {
-      this.socket!.write(words.join(" ") + "\r", err => (err ? reject(err) : resolve()));
-    });
-  }
-
-  private nextFrame(): Promise<string[]> {
-    if (!this.socket) return Promise.reject("socket closed");
+    // single‑use receiver during handshake – strips trailing CR or CRLF
+  private recvRaw(): Promise<string[]> {
     return new Promise(resolve => {
-      const onData = (chunk: Buffer) => {
-        const str = chunk.toString("utf8");
-        const idx = str.indexOf("\r");
-        if (idx !== -1) {
-          this.socket!.off("data", onData);
-          resolve(str.slice(0, idx).split(" "));
-        }
-      };
-      this.socket!.on("data", onData);
+      this.sock!.once("data", buf => {
+        const line = buf.toString("utf8").replace(/\r?\n?$/, "");
+        resolve(line.split(" "));
+      });
     });
   }
 
-  private timestamp14(date = new Date()): string {
-    return date.toISOString().replace(/[^0-9]/g, "").slice(0, 14);
-  }
-
-  // ────────────────────── inbound frame handling ──────────────────────
-
-  private isZoneResponse(m: ResponseMessage): m is ResponseMessage & { zone: ZoneDTO } {
-    return m.t === Resp.ZONE_INFO || m.t === Resp.ADD_ZONE || m.t === Resp.UPDATE_ZONE;
-  }
-
-  private isComponentResponse(m: ResponseMessage): m is ResponseMessage & { component: ComponentDTO } {
-    return m.t === Resp.COMPONENT_INFO || m.t === Resp.ADD_COMPONENT || m.t === Resp.UPDATE_COMPONENT;
-  }
-
-  private isWeekProfileResponse(m: ResponseMessage): m is ResponseMessage & { profile: WeekProfileDTO } {
-    return m.t === Resp.WEEK_PROFILE_INFO || m.t === Resp.ADD_WEEK_PROFILE || m.t === Resp.UPDATE_WEEK_PROFILE;
-  }
-
-  private isOverrideResponse(m: ResponseMessage): m is ResponseMessage & { override: OverrideDTO } {
-    return m.t === Resp.OVERRIDE_INFO || m.t === Resp.ADD_OVERRIDE;
-  }
-
-  private readonly handlers: Partial<Record<Resp, (m: ResponseMessage) => void>> = {
-    [Resp.ZONE_INFO]:      m => this.isZoneResponse(m) && this.zones.set(m.zone.zoneId, new ZoneVO(m.zone)),
-    [Resp.ADD_ZONE]:       m => this.isZoneResponse(m) && this.zones.set(m.zone.zoneId, new ZoneVO(m.zone)),
-    [Resp.UPDATE_ZONE]:    m => this.isZoneResponse(m) && this.zones.set(m.zone.zoneId, new ZoneVO(m.zone)),
-
-    [Resp.COMPONENT_INFO]: m => this.isComponentResponse(m) && this.components.set(m.component.serial, new ComponentVO(m.component)),
-    [Resp.ADD_COMPONENT]:  m => this.isComponentResponse(m) && this.components.set(m.component.serial, new ComponentVO(m.component)),
-    [Resp.UPDATE_COMPONENT]: m => this.isComponentResponse(m) && this.components.set(m.component.serial, new ComponentVO(m.component)),
-
-    [Resp.WEEK_PROFILE_INFO]: m => this.isWeekProfileResponse(m) && this.weekProfiles.set(m.profile.weekProfileId, new WeekProfileVO(m.profile)),
-    [Resp.ADD_WEEK_PROFILE]:  m => this.isWeekProfileResponse(m) && this.weekProfiles.set(m.profile.weekProfileId, new WeekProfileVO(m.profile)),
-    [Resp.UPDATE_WEEK_PROFILE]: m => this.isWeekProfileResponse(m) && this.weekProfiles.set(m.profile.weekProfileId, new WeekProfileVO(m.profile)),
-
-    [Resp.OVERRIDE_INFO]:  m => this.isOverrideResponse(m) && this.overrides.set(m.override.overrideId, new OverrideVO(m.override)),
-    [Resp.ADD_OVERRIDE]:   m => this.isOverrideResponse(m) && this.overrides.set(m.override.overrideId, new OverrideVO(m.override)),
-
-    [Resp.HUB_INFO]:       () => { this.hubInfoReceived = true; },
-
-    [Resp.REMOVE_ZONE]:       m => 'zoneId' in m && this.zones.delete(m.zoneId),
-    [Resp.REMOVE_COMPONENT]:  m => 'serial' in m && this.components.delete(m.serial),
-    [Resp.REMOVE_WEEK_PROFILE]: m => 'weekProfileId' in m && this.weekProfiles.delete(m.weekProfileId),
-    [Resp.REMOVE_OVERRIDE]:     m => 'overrideId' in m && this.overrides.delete(m.overrideId),
-
-    [Resp.COMPONENT_TEMP]:  m => 'serial' in m && 'temperature' in m && this.temperatures.set(m.serial, m.temperature),
-
-    [Resp.ERROR]:          m => 'code' in m && 'message' in m && console.error("hub error", m.code, m.message),
-  } as const;
-
-  private process(m: ResponseMessage): void {
-    const handler = this.handlers[m.t];
-    if (handler) {
-      handler(m);
+  private async pump() {
+    if (!this.sock) return;
+    // heartbeat – fire‑and‑forget
+    const hb = setInterval(() => this.send([Cmd.HANDSHAKE]).catch(() => {}), 14_000);
+    for await (const parts of frames(this.sock)) {
+      this.lastRx = Date.now();
+      this.dispatch(parse(parts));
     }
+    clearInterval(hb);
   }
 
-  // ──────────────────────  Public high‑level helpers  ──────────────────────
+  private dispatch(msg: ResponseMessage) {
+    switch (msg.t) {
+      case Resp.SENDING_ALL_INFO:
+        this.zones.clear(); this.comps.clear(); this.weeks.clear(); this.overrides.clear(); this.temps.clear(); break;
+      case Resp.ZONE_INFO: case Resp.ADD_ZONE: case Resp.UPDATE_ZONE:
+        this.zones.set(msg.zone.zoneId, new ZoneVO(msg.zone)); break;
+      case Resp.COMPONENT_INFO: case Resp.ADD_COMPONENT: case Resp.UPDATE_COMPONENT:
+        this.comps.set(msg.component.serial, new ComponentVO(msg.component)); break;
+      case Resp.WEEK_PROFILE_INFO: case Resp.ADD_WEEK_PROFILE: case Resp.UPDATE_WEEK_PROFILE:
+        this.weeks.set(msg.profile.weekProfileId, new WeekProfileVO(msg.profile)); break;
+      case Resp.OVERRIDE_INFO: case Resp.ADD_OVERRIDE:
+        this.overrides.set(msg.override.overrideId, new OverrideVO(msg.override)); break;
+      case Resp.HUB_INFO: case Resp.UPDATE_HUB_INFO:
+        this.hubInfo = msg.hub; if (msg.t === Resp.HUB_INFO) this.emit("ready"); break;
+      case Resp.UPDATE_INTERNET_ACCESS:
+        this.emit("internet", { enabled: msg.access === "1", key: msg.key }); break;
+      case Resp.REMOVE_ZONE:        this.zones.delete(msg.zoneId); break;
+      case Resp.REMOVE_COMPONENT:   this.comps.delete(msg.serial); break;
+      case Resp.REMOVE_WEEK_PROFILE:this.weeks.delete(msg.weekProfileId); break;
+      case Resp.REMOVE_OVERRIDE:    this.overrides.delete(msg.overrideId); break;
+      case Resp.COMPONENT_TEMP:     this.temps.set(msg.serial, msg.temperature); break;
+      case Resp.ERROR:              this.emit("error", new Error(`Hub error ${msg.code}: ${msg.message}`)); break;
+    }
+    this.emit("update", msg);
+  }
 
-  /** Shortcut to change only temperatures. */
+  // ─────────────────────── public API ───────────────────────
   async setZoneTemperatures(id: string, comfort: number, eco: number) {
-    await this.hubReady;
-    assertTemperature(comfort, "comfort");
-    assertTemperature(eco, "eco");
-    if (comfort < eco) throw new RangeError("comfort < eco");
-
-    const zone = this.zones.get(id);
-    if (!zone) throw new Error(`unknown zone ${id}`);
-
-    await this.send([Cmd.UPDATE_ZONE, id, zone.name, zone.weekProfileId, String(comfort), String(eco), zone.allowsOverride ? Override.Allowed.YES : Override.Allowed.NO, "-1"]);
+    const z = this.zones.get(id); if (!z) throw new Error("unknown zone");
+    assertTemperature(comfort); assertTemperature(eco); if (comfort < eco) throw new Error("comfort<eco");
+    await this.send([Cmd.UPDATE_ZONE, id, z.name, z.weekProfileId, comfort.toString(), eco.toString(), z.allowsOverride ? Override.Allowed.YES : Override.Allowed.NO, "-1"]);
   }
 
-  /** Create override with basic validation. */
-  async createOverride(options: {
-    mode: keyof typeof Override.Mode;
-    type: keyof typeof Override.Type;
-    targetType: keyof typeof Override.Target;
-    targetId?: string;
-    startTime?: string;
-    endTime?: string;
-  }) {
-    await this.hubReady;
-    const { mode, type, targetType } = options;
-    const targetId = options.targetId ?? "-1";
-    const start = options.startTime ?? "-1";
-    const end = options.endTime ?? "-1";
-
-    if (start !== "-1" && (!isValidDatetime(start) || !quarterMinutes(start.slice(-2)))) {
-      throw new RangeError(`invalid start ${start}`);
-    }
-    if (end !== "-1" && (!isValidDatetime(end) || !quarterMinutes(end.slice(-2)))) {
-      throw new RangeError(`invalid end ${end}`);
-    }
-
-    await this.send([Cmd.ADD_OVERRIDE, "1", Override.Mode[mode], Override.Type[type], end, start, Override.Target[targetType], targetId]);
+  async createOverride(opts: { mode: keyof typeof Override.Mode; type: keyof typeof Override.Type; targetType: keyof typeof Override.Target; targetId?: string; startTime?: string; endTime?: string }) {
+    const { mode, type, targetType } = opts;
+    const start = opts.startTime ?? "-1"; const end = opts.endTime ?? "-1"; const tgt = opts.targetId ?? "-1";
+    if (start !== "-1" && (!isValidDatetime(start) || !quarterMinutes(start.slice(-2)))) throw new Error("bad start");
+    if (end !== "-1" && (!isValidDatetime(end) || !quarterMinutes(end.slice(-2))))   throw new Error("bad end");
+    await this.send([Cmd.ADD_OVERRIDE, "1", Override.Mode[mode], Override.Type[type], end, start, Override.Target[targetType], tgt]);
   }
 
-  /** Convenience helpers */
-  getCurrentTemperature(zoneId: string): string | null {
-    for (const comp of this.components.values()) {
-      if (comp.dto.zoneId === zoneId) {
-        const t = this.temperatures.get(comp.dto.serial);
-        if (t) return t === "N/A" ? null : t;
-      }
+  getZoneMode(id: string, when = new Date()): "eco" | "comfort" | "away" | "off" | "normal" {
+    const z = this.zones.get(id); if (!z) throw new Error("bad zone");
+    // override precedence
+    for (const ov of this.overrides.values()) {
+      if (ov.d.mode === Override.Mode.NORMAL) continue;
+      if (ov.d.targetType === Override.Target.ZONE && ov.d.targetId === id) return mapMode(ov.d.mode);
+      if (ov.d.targetType === Override.Target.GLOBAL && z.allowsOverride) return mapMode(ov.d.mode);
     }
+    return this.weeks.get(z.weekProfileId)?.statusAt(when) ?? "normal";
+  }
+  getCurrentTemperature(id: string) {
+    for (const c of this.comps.values()) if (c.d.zoneId === id) {
+      const t = this.temps.get(c.d.serial); if (t && t !== "N/A") return t; }
     return null;
   }
 }
+function mapMode(m: string) {
+  return m === "1" ? "comfort" : m === "2" ? "eco" : "away";
+}
+function once(emitter: net.Socket | EventEmitter, ev: string) { return new Promise<any>(res => emitter.once(ev, res)); }

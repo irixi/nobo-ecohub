@@ -1,20 +1,10 @@
-export function isValidDatetime(ts: string): boolean {
-  return /^\d{14}$/.test(ts);
+export const isValidDatetime = (ts: string): boolean => /^\d{14}$/.test(ts);
+export const quarterMinutes = (m: string): boolean => Number(m) % 15 === 0;
+export function assertTemperature(v: number | string, label = "temp") {
+  const n = +v;
+  if (!Number.isFinite(n)) throw new TypeError(`${label} not numeric`);
+  if (n < 7 || n > 30) throw new RangeError(`${label} out of range 7‑30°C`);
 }
-
-export function quarterMinutes(mins: string): boolean {
-  const m = Number(mins);
-  return m >= 0 && m < 60 && m % 15 === 0;
-}
-
-export function assertTemperature(temp: number | string, label = "temperature"): void {
-  const val = Number(temp);
-  if (!Number.isFinite(val)) throw new RangeError(`${label} must be numeric`);
-  if (val < 7 || val > 30) throw new RangeError(`${label} must be between 7 – 30 °C`);
-}
-
-export function assertLengthUtf8(text: string, bytes: number, label: string): void {
-  if (Buffer.byteLength(text, "utf8") > bytes) {
-    throw new RangeError(`${label} is longer than ${bytes} bytes (utf‑8)`);
-  }
+export function assertUtf8(text: string, max: number, label: string) {
+  if (Buffer.byteLength(text, "utf8") > max) throw new RangeError(`${label} >${max}B utf8`);
 }

@@ -1,14 +1,14 @@
 import net from "node:net";
 
-/** Split a TCP stream into protocol frames (string[]). */
-export async function* frames(socket: net.Socket): AsyncIterable<string[]> {
+export async function* frames(sock: net.Socket): AsyncIterable<string[]> {
   let buf = "";
-  for await (const chunk of socket) {
+  for await (const chunk of sock) {
     buf += chunk.toString("utf8");
-    const parts = buf.split("\r");
-    buf = parts.pop() ?? "";
-    for (const p of parts) {
-      if (p) yield p.split(" ");
+    let idx;
+    while ((idx = buf.indexOf("\r")) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (frame) yield frame.split(" ");
     }
   }
 }
